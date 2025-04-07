@@ -264,7 +264,16 @@ class CentralValueTrain(nn.Module):
         else:
             for param in self.model.parameters():
                 param.grad = None
-        loss.backward()
+        with torch.autograd.detect_anomaly():
+            loss.backward()
+
+        # import torchviz
+        # # Visualizing the computation graph
+        # graph = torchviz.make_dot(loss, params=dict(self.model.named_parameters()))
+        # graph.render("central_value_train", format="png")  # Saves the graph as 'computation_graph.png'
+
+        # import ipdb; ipdb.set_trace()
+
 
         if self.multi_gpu:
             # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220

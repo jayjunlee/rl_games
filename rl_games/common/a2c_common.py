@@ -343,8 +343,11 @@ class A2CBase(BaseAlgorithm):
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
 
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.mixed_precision:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
     def load_networks(self, params):
         builder = model_builder.ModelBuilder()
@@ -357,7 +360,7 @@ class A2CBase(BaseAlgorithm):
             network = builder.load(params['config']['central_value_config'])
             self.config['central_value_config']['network'] = network
 
-    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
+    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames, mus, sigmas):
         # do we need scaled time?
         self.diagnostics.send_info(self.writer)
         self.writer.add_scalar('performance/step_inference_rl_update_fps', curr_frames / scaled_time, frame)
@@ -377,6 +380,8 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('info/e_clip', self.e_clip * lr_mul, frame)
         self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
         self.writer.add_scalar('info/epochs', epoch_num, frame)
+        self.writer.add_scalar('info/mus', torch_ext.mean_list(mus).item(), frame)
+        self.writer.add_scalar('info/sigmas', torch_ext.mean_list(sigmas).item(), frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
     def set_eval(self):
@@ -418,6 +423,7 @@ class A2CBase(BaseAlgorithm):
         }
 
         with torch.no_grad():
+            # import ipdb; ipdb.set_trace()
             res_dict = self.model(input_dict)
             if self.has_central_value:
                 states = obs['states']
@@ -531,6 +537,7 @@ class A2CBase(BaseAlgorithm):
         return actions
 
     def env_step(self, actions):
+        # import ipdb; ipdb.set_trace()
         actions = self.preprocess_actions(actions)
         obs, rewards, dones, infos = self.vec_env.step(actions)
 
@@ -1222,15 +1229,19 @@ class ContinuousA2CBase(A2CBase):
         b_losses = []
         entropies = []
         kls = []
+        mus = []
+        sigmas = []
 
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, mu, sigma = self.train_actor_critic(self.dataset[i])
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
                 ep_kls.append(kl)
                 entropies.append(entropy)
+                mus.append(mu)
+                sigmas.append(sigma)
                 if self.bounds_loss_coef is not None:
                     b_losses.append(b_loss)
 
@@ -1261,7 +1272,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, mus, sigmas
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1348,10 +1359,10 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, mus, sigmas = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
-
+            # import ipdb; ipdb.set_trace()
             # cleaning memory to optimize space
             self.dataset.update_values_dict(None)
             should_exit = False
@@ -1369,7 +1380,7 @@ class ContinuousA2CBase(A2CBase):
 
                 self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
                                 a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
-                                scaled_time, scaled_play_time, curr_frames)
+                                scaled_time, scaled_play_time, curr_frames, mus, sigmas)
 
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)

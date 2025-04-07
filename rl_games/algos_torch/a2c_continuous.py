@@ -7,6 +7,7 @@ from rl_games.common import datasets
 
 from torch import optim
 import torch 
+from torch import autograd
 
 
 class A2CAgent(a2c_common.ContinuousA2CBase):
@@ -62,6 +63,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 'zero_rnn_on_done' : self.zero_rnn_on_done
             }
             self.central_value_net = central_value.CentralValueTrain(**cv_config).to(self.ppo_device)
+
+        # import ipdb; ipdb.set_trace()
 
         self.use_experimental_cv = self.config.get('use_experimental_cv', True)
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_length)
@@ -128,17 +131,34 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 batch_dict['dones'] = input_dict['dones']            
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
-            res_dict = self.model(batch_dict)
+            try:
+                with torch.autograd.detect_anomaly():
+                    res_dict = self.model(batch_dict)
+            except RuntimeError as e:
+                import traceback
+                print("\nCaught RuntimeError during backward pass!")
+                traceback.print_exc()  # Print the full error traceback
+                print("\n🔍 Debugging Info:")
+
+                import ipdb; ipdb.set_trace()
             action_log_probs = res_dict['prev_neglogp']
             values = res_dict['values']
             entropy = res_dict['entropy']
             mu = res_dict['mus']
             sigma = res_dict['sigmas']
 
+            if torch.isnan(mu).any() or torch.isinf(mu).any():
+                print(f"[ERROR] NaN or Inf detected in `mu`! Mean: {mu.mean().item()}, Max: {mu.max().item()}, Min: {mu.min().item()}")
+
+            if torch.isnan(sigma).any() or torch.isinf(sigma).any():
+                print(f"[ERROR] NaN or Inf detected in `sigma`! Mean: {sigma.mean().item()}, Max: {sigma.max().item()}, Min: {sigma.min().item()}")
+
+
+
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
             if self.has_value_loss:
-                c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
+                c_loss = common_losses.critic_loss(self.model, value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
             else:
                 c_loss = torch.zeros(1, device=self.ppo_device)
             if self.bound_loss_type == 'regularisation':
@@ -149,6 +169,15 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 b_loss = torch.zeros(1, device=self.ppo_device)
             losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+
+
+            if torch.isnan(a_loss).any() or torch.isinf(a_loss).any():
+                print(f"[ERROR] NaN or Inf in Actor Loss! Value: {a_loss.item()}")
+            if torch.isnan(c_loss).any() or torch.isinf(c_loss).any():
+                print(f"[ERROR] NaN or Inf in Critic Loss! Value: {c_loss.item()}")
+            if torch.isnan(b_loss).any() or torch.isinf(b_loss).any():
+                print(f"[ERROR] NaN or Inf in Bound Loss! Value: {b_loss.item()}")
+
 
             loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             aux_loss = self.model.get_aux_loss()
@@ -166,7 +195,42 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 for param in self.model.parameters():
                     param.grad = None
 
-        self.scaler.scale(loss).backward()
+        try:
+            with torch.autograd.detect_anomaly():
+                if self.mixed_precision:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+        except RuntimeError as e:
+            import traceback
+            print("\nCaught RuntimeError during backward pass!")
+            traceback.print_exc()  # Print the full error traceback
+            print("\n🔍 Debugging Info:")
+
+            import ipdb; ipdb.set_trace()
+            print(mu.mean().item(), mu.min().item(), mu.max().item())
+            print(sigma.mean().item(), sigma.min().item(), sigma.max().item())
+
+
+            # Check if loss contains NaNs/Infs
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                print(f"NaN/Inf detected in loss! Value: {loss}")
+
+            # Check gradients for NaNs/Infs
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        print(f"NaN/Inf detected in gradients of {name}!")
+
+            
+
+        # import torchviz
+        # # Visualizing the computation graph
+        # graph = torchviz.make_dot(loss, params=dict(self.model.named_parameters()))
+        # graph.render("computation_graph", format="png")  # Saves the graph as 'computation_graph.png'
+
+        # import ipdb; ipdb.set_trace()
+
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step()
 
@@ -175,6 +239,10 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             kl_dist = torch_ext.policy_kl(mu.detach(), sigma.detach(), old_mu_batch, old_sigma_batch, reduce_kl)
             if rnn_masks is not None:
                 kl_dist = (kl_dist * rnn_masks).sum() / rnn_masks.numel()  #/ sum_mask
+
+            if kl_dist > 0.05:
+                print(f"KL explosion detected! {kl_dist} mu mean: {mu.mean().item()}, sigma mean: {sigma.mean().item()}")
+
 
         self.diagnostics.mini_batch(self,
         {
@@ -185,9 +253,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             'masks' : rnn_masks
         }, curr_e_clip, 0)      
 
-        self.train_result = (a_loss, c_loss, entropy, \
-            kl_dist, self.last_lr, lr_mul, \
-            mu.detach(), sigma.detach(), b_loss)
+        self.train_result = (a_loss, c_loss, entropy, kl_dist, self.last_lr, lr_mul, mu.detach(), sigma.detach(), b_loss, mu.mean(), sigma.mean()) # TODO: add mus and sigmas here?
 
     def train_actor_critic(self, input_dict):
         self.calc_gradients(input_dict)

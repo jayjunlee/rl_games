@@ -280,7 +280,11 @@ class ModelA2CContinuousLogStd(BaseModel):
             is_train = input_dict.get('is_train', True)
             prev_actions = input_dict.get('prev_actions', None)
             input_dict['obs'] = self.norm_obs(input_dict['obs'])
+            # import ipdb; ipdb.set_trace()
             mu, logstd, value, states = self.a2c_network(input_dict)
+            logstd_min, logstd_max = -2.0, 1.0  # Define the limits
+            logstd = logstd_min + 0.5 * (logstd_max - logstd_min) * (torch.tanh(logstd) + 1)
+
             sigma = torch.exp(logstd)
             distr = torch.distributions.Normal(mu, sigma, validate_args=False)
             if is_train:

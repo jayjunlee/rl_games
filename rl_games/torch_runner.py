@@ -143,9 +143,9 @@ class Runner:
 
         """
         print('Started to train')
-        agent = self.algo_factory.create(self.algo_name, base_name='run', params=self.params)
-        _restore(agent, args)
-        _override_sigma(agent, args)
+        agent: a2c_continuous.A2CAgent = self.algo_factory.create(self.algo_name, base_name='run', params=self.params)
+        _restore(agent, args)           # loading a provided checkpoint
+        _override_sigma(agent, args)    # overriding sigma of the policy network
         agent.train()
 
     def run_play(self, args):
@@ -156,7 +156,7 @@ class Runner:
 
         """
         print('Started to play')
-        player = self.create_player()
+        player: players.PpoPlayerContinuous = self.create_player()
         _restore(player, args)
         _override_sigma(player, args)
         player.run()
